@@ -1,3 +1,6 @@
 **/__pycache__
-
+results_*/
+data/users/*.sqlite
+dump/
+system_outputs/test/
 

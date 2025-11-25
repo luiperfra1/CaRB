@@ -1,4 +1,4 @@
-from sklearn.preprocessing.data import binarize
+from sklearn.preprocessing import binarize
 from oie_readers.argument import Argument
 from operator import itemgetter
 from collections import defaultdict
