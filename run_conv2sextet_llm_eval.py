@@ -1,6 +1,7 @@
 # run_conv2sextet_llm_eval_models.py
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 import time
@@ -8,19 +9,26 @@ import json
 import csv
 import re
 from typing import List, Tuple, Dict, Any
+from dotenv import load_dotenv
 
-PROJECT_ROOT = r"C:/Users/maner/Desktop/ESTUDIOS/conversation2bd_memCorto"
-if PROJECT_ROOT not in sys.path:
+load_dotenv()
+
+PROJECT_ROOT = os.environ.get("PROJECT_ROOT")
+
+print(f"[INFO] PROJECT_ROOT={PROJECT_ROOT}")
+if PROJECT_ROOT not in sys.path and PROJECT_ROOT is not None:
     sys.path.append(PROJECT_ROOT)
 
 # --- Extractor (usa su pipeline actual de sextetas) ---
 from text2triplets.text2triplet import run_kg, KGConfig, SEXTET_PROMPT_EN  # type: ignore
 
-# --- Evaluator LLM client ---
-from utils.llm_client import LLMClient
-
-
-Sextet = Tuple[str, str, str, str, str, str]
+# --- Lógica del juez (externalizada) ---
+from eval_llm_juez import (
+    Sextet,
+    EVALUATOR_MODEL,
+    build_evaluator,
+    evaluate_sentence,
+)
 
 SCRIPT_ROOT = pathlib.Path(__file__).resolve().parent
 DATA_ROOT = SCRIPT_ROOT / "data"
@@ -29,7 +37,7 @@ TEST_SENTENCES = DATA_ROOT / "test.txt"
 OUT_ROOT = SCRIPT_ROOT / "results_llm_eval_models"
 OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-MAX_SENTENCES = 50  # igual que antes
+MAX_SENTENCES = 100 # igual que antes
 
 
 # ==============================
@@ -37,78 +45,44 @@ MAX_SENTENCES = 50  # igual que antes
 # ==============================
 MODELS = (
     # === MODELOS GRANDES (para pruebas serias pero lentas) ===
-    #"openai/qwen2.5:72b",
-    #"openai/deepseek-llm:67b",
-    #"openai/llama3.3:latest",
+    # "openai/qwen2.5:72b",
+    # "openai/deepseek-llm:67b",
+    # "openai/llama3.3:latest",
 
     # === MODELOS MEDIOS ===
     "openai/qwen2.5:32b",       # activo por defecto
-    #"openai/deepseek-r1:32b",
-    "openai/openthinker:32b",   # contraste útil
-    #"openai/exaone-deep:32b",
+    # "openai/deepseek-r1:32b",
+    # "openai/openthinker:32b",   # contraste útil
+    # "openai/exaone-deep:32b",
 
     # === MODELOS PEQUEÑOS ===
-    #"openai/qwen2.5:14b",
+    # "openai/qwen2.5:14b",
     "openai/hermes3:8b",        # baseline pequeño activo
-    #"openai/llama3.1:8b",
-    #"openai/cogito:8b",
-    #"openai/exaone-deep:7.8b",
-    #"openai/mixtral:latest"
+    # "openai/llama3.1:8b",
+    # "openai/cogito:8b",
+    # "openai/exaone-deep:7.8b",
+    # "openai/mixtral:latest"
 )
 
-# ==============================
-# MODELO EVALUADOR (fijo)
-# ==============================
-EVALUATOR_MODEL = "qwen2.5:32b"
 
+def slugify_model(model_name: str, n_sentences: int) -> str:
+    """
+    Normaliza el nombre del modelo extractor para crear carpetas limpias.
+    Ejemplo:
+        "openai/qwen2.5:32b" → "qwen2.5_32b_50s"
+    """
+    # 1) Quitamos prefijo tipo "openai/"
+    if "/" in model_name:
+        model_name = model_name.split("/", 1)[1]
 
-EVALUATOR_SYSTEM_PROMPT = """
-You are a strict but fair evaluator of extracted sextets from a sentence.
-
-You will receive:
-1) ORIGINAL SENTENCE (natural language)
-2) EXTRACTED SEXTETS list, each with format:
-   (subject, verb, predicate, frequency/temporality, condition, probability)
-
-Your task:
-- Judge how well the sextets capture ONLY the facts in the original sentence.
-- Penalize hallucinations, wrong subjects/verbs/objects, missing info, wrong temporality/condition.
-- Reward correct, complete, and well-scoped sextets.
-
-Return ONLY valid JSON with this schema:
-{
-  "scores": {
-    "correctness": 0-5,
-    "completeness": 0-5,
-    "no_hallucination": 0-5,
-    "format_quality": 0-5
-  },
-  "overall": 0-5,
-  "errors": [
-    {
-      "type": "hallucination|missing_fact|wrong_relation|wrong_subject|wrong_temporality|wrong_condition|format_error",
-      "detail": "short explanation"
-    }
-  ],
-  "suggestions": [
-    "short actionable suggestion",
-    ...
-  ]
-}
-
-Rules:
-- Be concise.
-- If something is uncertain in the sentence, sextets must reflect uncertainty via probability/condition; otherwise penalize.
-- If sextets are empty and sentence has facts, correctness/completeness should be low.
-- "overall" should reflect your true assessment, not a simple average.
-"""
-
-
-def slugify_model(model_name: str) -> str:
-    # openai/qwen2.5:32b -> openai_qwen2.5_32b
-    s = model_name.strip().replace("/", "_").replace(":", "_")
+    # 2) Convertimos ":" a "_" y eliminamos caracteres raros
+    s = model_name.strip().replace(":", "_")
     s = re.sub(r"[^a-zA-Z0-9_.-]+", "_", s)
+
+    # 3) Añadimos sufijo "_Ns" (ej: "_50s")
+    s += f"_{n_sentences}s"
     return s
+
 
 
 def extract_sextets(text: str, extractor_model: str) -> List[Sextet]:
@@ -138,67 +112,14 @@ def extract_sextets(text: str, extractor_model: str) -> List[Sextet]:
     return fixed
 
 
-def build_evaluator() -> Any:
-    if LLMClient is None:
-        raise RuntimeError(
-            "No pude importar LLMClient. Ajuste el import arriba a la ruta correcta."
-        )
-    return LLMClient(model=EVALUATOR_MODEL, temperature=0.0)
-
-
-def evaluate_sentence(evaluator: Any, sentence: str, sextets: List[Sextet]) -> Dict[str, Any]:
-    prompt = (
-        f"ORIGINAL SENTENCE:\n{sentence}\n\n"
-        f"EXTRACTED SEXTETS:\n{json.dumps(sextets, ensure_ascii=False)}\n\n"
-        "EVALUATE NOW."
-    )
-
-    try:
-        raw = evaluator.complete(system=EVALUATOR_SYSTEM_PROMPT, user=prompt)
-    except Exception:
-        raw = evaluator.chat(
-            [
-                {"role": "system", "content": EVALUATOR_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ]
-        )
-
-    if isinstance(raw, dict):
-        return raw
-
-    text = str(raw).strip()
-
-    try:
-        return json.loads(text)
-    except Exception:
-        try:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                return json.loads(text[start:end + 1])
-        except Exception:
-            pass
-
-    return {
-        "scores": {
-            "correctness": 0,
-            "completeness": 0,
-            "no_hallucination": 0,
-            "format_quality": 0,
-        },
-        "overall": 0,
-        "errors": [{"type": "format_error", "detail": "Evaluator output not valid JSON"}],
-        "suggestions": [],
-        "raw_output": text,
-    }
-
-
 def avg(xs: List[float]) -> float:
     return sum(xs) / len(xs) if xs else 0.0
 
 
 def run_for_model(extractor_model: str, evaluator: Any) -> Dict[str, Any]:
-    model_slug = slugify_model(extractor_model)
+    # Número de frases procesadas = MAX_SENTENCES o número real del archivo
+    model_slug = slugify_model(extractor_model, MAX_SENTENCES)
+
     model_out = OUT_ROOT / model_slug
     model_out.mkdir(parents=True, exist_ok=True)
 
@@ -217,6 +138,7 @@ def run_for_model(extractor_model: str, evaluator: Any) -> Dict[str, Any]:
     extraction_time_no_warmup = 0.0
     n_time = 0
 
+    # -------- EXTRACCIÓN DE SEXTETAS --------
     with TEST_SENTENCES.open("r", encoding="utf-8") as fin:
         for idx, line in enumerate(fin, start=1):
             if idx > MAX_SENTENCES:
@@ -253,6 +175,7 @@ def run_for_model(extractor_model: str, evaluator: Any) -> Dict[str, Any]:
 
     print(f"\n[OK] Predicciones guardadas en: {predictions_json}")
 
+    # -------- EVALUACIÓN CON EL JUEZ LLM --------
     eval_time_no_warmup = 0.0
     n_eval_time = 0
 
@@ -337,6 +260,7 @@ def main() -> None:
     if not TEST_SENTENCES.exists():
         raise FileNotFoundError(f"No existe {TEST_SENTENCES}. Revise ruta/archivo.")
 
+    # Construimos juez una sola vez (modelo fijo, importado de eval_llm_juez)
     evaluator = build_evaluator()
 
     all_summaries: List[Dict[str, Any]] = []
@@ -346,7 +270,7 @@ def main() -> None:
             all_summaries.append(summary)
         except Exception as e:
             print(f"\n[ERROR] Falló modelo {m}: {e}\n")
-            # continua con el resto
+            # continúa con el resto
             continue
 
     # CSV global agregando todos los modelos
