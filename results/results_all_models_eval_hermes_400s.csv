@@ -1,0 +1,2 @@
+extractor_model,evaluator_model,n_sentences,avg_overall,avg_correctness,avg_completeness,avg_no_hallucination,avg_format_quality,extraction_time_no_warmup_s,evaluation_time_no_warmup_s
+openai/qwen2.5:32b,hermes3:8b,400,4.48625,4.7275,3.85,4.9875,4.6975,1660.9424864023458,1077.514877401758
